@@ -46,6 +46,7 @@
 
 #define Dot(u,v)	(u[0]*v[0] + u[1]*v[1] + u[2]*v[2])
 
+#if defined(FOR_TRITE_TEST_PROGRAM) || defined(TRUE_PROJECT)
 static void Normalize( TESSreal v[3] )
 {
 	TESSreal len = v[0]*v[0] + v[1]*v[1] + v[2]*v[2];
@@ -56,6 +57,7 @@ static void Normalize( TESSreal v[3] )
 	v[1] /= len;
 	v[2] /= len;
 }
+#endif
 
 #define ABS(x)	((x) < 0 ? -(x) : (x))
 
@@ -65,6 +67,15 @@ static int LongAxis( TESSreal v[3] )
 
 	if( ABS(v[1]) > ABS(v[0]) ) { i = 1; }
 	if( ABS(v[2]) > ABS(v[i]) ) { i = 2; }
+	return i;
+}
+
+static int ShortAxis( TESSreal v[3] )
+{
+	int i = 0;
+
+	if( ABS(v[1]) < ABS(v[0]) ) { i = 1; }
+	if( ABS(v[2]) < ABS(v[i]) ) { i = 2; }
 	return i;
 }
 
@@ -134,7 +145,7 @@ static void ComputeNormal( TESStesselator *tess, TESSreal norm[3] )
 	if( maxLen2 <= 0 ) {
 		/* All points lie on a single line -- any decent normal will do */
 		norm[0] = norm[1] = norm[2] = 0;
-		norm[LongAxis(d1)] = 1;
+		norm[ShortAxis(d1)] = 1;
 	}
 }
 
@@ -363,7 +374,6 @@ int tessMeshTessellateMonoRegion( TESSmesh *mesh, TESSface *face )
 	return 1;
 }
 
-
 /* tessMeshTessellateInterior( mesh ) tessellates each region of
 * the mesh which is marked "inside" the polygon.  Each such region
 * must be monotone.
@@ -380,8 +390,122 @@ int tessMeshTessellateInterior( TESSmesh *mesh )
 			if ( !tessMeshTessellateMonoRegion( mesh, f ) ) return 0;
 		}
 	}
-
 	return 1;
+}
+
+
+typedef struct EdgeStackNode EdgeStackNode;
+typedef struct EdgeStack EdgeStack;
+
+struct EdgeStackNode {
+	TESShalfEdge *edge;
+	EdgeStackNode *next;
+};
+
+struct EdgeStack {
+	EdgeStackNode *top;
+	struct BucketAlloc *nodeBucket;
+};
+
+int stackInit( EdgeStack *stack, TESSalloc *alloc )
+{
+	stack->top = NULL;
+	stack->nodeBucket = createBucketAlloc( alloc, "CDT nodes", sizeof(EdgeStackNode), 512 );
+	return stack->nodeBucket != NULL;
+}
+
+void stackDelete( EdgeStack *stack )
+{
+    deleteBucketAlloc( stack->nodeBucket );
+}
+
+int stackEmpty( EdgeStack *stack )
+{
+	return stack->top == NULL;
+}
+
+void stackPush( EdgeStack *stack, TESShalfEdge *e )
+{
+	EdgeStackNode *node = (EdgeStackNode *)bucketAlloc( stack->nodeBucket );
+	if ( ! node ) return;
+	node->edge = e;
+	node->next = stack->top;
+	stack->top = node;
+}
+
+TESShalfEdge *stackPop( EdgeStack *stack )
+{
+	TESShalfEdge *e = NULL;
+	EdgeStackNode *node = stack->top;
+	if (node) {
+		stack->top = node->next;
+		e = node->edge;
+		bucketFree( stack->nodeBucket, node );
+	}
+	return e;
+}
+
+
+//	Starting with a valid triangulation, uses the Edge Flip algorithm to
+//	refine the triangulation into a Constrained Delaunay Triangulation.
+void tessMeshRefineDelaunay( TESSmesh *mesh, TESSalloc *alloc )
+{
+	// At this point, we have a valid, but not optimal, triangulation.
+	// We refine the triangulation using the Edge Flip algorithm
+	//
+	//  1) Find all internal edges
+	//	2) Mark all dual edges
+	//	3) insert all dual edges into a queue
+
+	TESSface *f;
+	EdgeStack stack;
+	TESShalfEdge *e;
+	int maxFaces = 0, maxIter = 0, iter = 0;
+
+	stackInit(&stack, alloc);
+
+	for( f = mesh->fHead.next; f != &mesh->fHead; f = f->next ) {
+		if ( f->inside) {
+			e = f->anEdge;
+			do {
+				e->mark = EdgeIsInternal(e); // Mark internal edges
+				if (e->mark && !e->Sym->mark) stackPush(&stack, e); // Insert into queue
+				e = e->Lnext;
+			} while (e != f->anEdge);
+			maxFaces++;
+		}
+	}
+
+	// The algorithm should converge on O(n^2), since the predicate is not robust,
+	// we'll save guard against infinite loop.
+	maxIter = maxFaces * maxFaces;
+
+	// Pop stack until we find a reversed edge
+	// Flip the reversed edge, and insert any of the four opposite edges
+	// which are internal and not already in the stack (!marked)
+	while (!stackEmpty(&stack) && iter < maxIter) {
+		e = stackPop(&stack);
+		e->mark = e->Sym->mark = 0;
+		if (!tesedgeIsLocallyDelaunay(e)) {
+			TESShalfEdge *edges[4];
+			int i;
+			tessMeshFlipEdge(mesh, e);
+			// for each opposite edge
+			edges[0] = e->Lnext;
+			edges[1] = e->Lprev;
+			edges[2] = e->Sym->Lnext;
+			edges[3] = e->Sym->Lprev;
+			for (i = 0; i < 4; i++) {
+				if (!edges[i]->mark && EdgeIsInternal(edges[i])) {
+					edges[i]->mark = edges[i]->Sym->mark = 1;
+					stackPush(&stack, edges[i]);
+				}
+			}
+		}
+		iter++;
+	}
+
+	stackDelete(&stack);
 }
 
 
@@ -438,16 +562,19 @@ int tessMeshSetWindingNumber( TESSmesh *mesh, int value,
 
 void* heapAlloc( void* userData, unsigned int size )
 {
+	TESS_NOTUSED( userData );
 	return malloc( size );
 }
 
 void* heapRealloc( void *userData, void* ptr, unsigned int size )
 {
+	TESS_NOTUSED( userData );
 	return realloc( ptr, size );
 }
 
 void heapFree( void* userData, void* ptr )
 {
+	TESS_NOTUSED( userData );
 	free( ptr );
 }
 
@@ -502,7 +629,10 @@ TESStesselator* tessNewTess( TESSalloc* alloc )
 	tess->bmax[0] = 0;
 	tess->bmax[1] = 0;
 
+	tess->reverseContours = 0;
+    
 	tess->windingRule = TESS_WINDING_ODD;
+	tess->processCDT = 0;
 
 	if (tess->alloc.regionBucketSize < 16)
 		tess->alloc.regionBucketSize = 16;
@@ -846,10 +976,24 @@ void tessAddContour( TESStesselator *tess, int size, const void* vertices,
 		* vertices in such an order that a CCW contour will add +1 to
 		* the winding number of the region inside the contour.
 		*/
-		e->winding = 1;
-		e->Sym->winding = -1;
+        e->winding = tess->reverseContours ? -1 : 1;
+        e->Sym->winding = tess->reverseContours ? 1 : -1;
 	}
 }
+
+void tessSetOption( TESStesselator *tess, int option, int value )
+{
+	switch(option)
+	{
+	case TESS_CONSTRAINED_DELAUNAY_TRIANGULATION:
+		tess->processCDT = value > 0 ? 1 : 0;
+		break;
+	case TESS_REVERSE_CONTOURS:
+		tess->reverseContours = value > 0 ? 1 : 0;
+		break;
+	}
+}
+
 
 int tessTesselate( TESStesselator *tess, int windingRule, int elementType,
 				  int polySize, int vertexSize, const TESSreal* normal )
@@ -921,6 +1065,8 @@ int tessTesselate( TESStesselator *tess, int windingRule, int elementType,
 		rc = tessMeshSetWindingNumber( mesh, 1, TRUE );
 	} else {
 		rc = tessMeshTessellateInterior( mesh );
+		if (rc != 0 && tess->processCDT != 0)
+			tessMeshRefineDelaunay( mesh, &tess->alloc );
 	}
 	if (rc == 0) longjmp(tess->env,1);  /* could've used a label */
 
